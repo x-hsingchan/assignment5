@@ -210,8 +210,9 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
-
+    PROJECT_ROOT = Path(__file__).parent.parent
+    MODEL_PATH = PROJECT_ROOT / "cs336_alignment" / "model" /"Qwen2.5-Math-1.5B"
+    return str(MODEL_PATH)
 
 @pytest.fixture
 def tokenizer(model_id):
