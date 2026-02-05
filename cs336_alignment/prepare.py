@@ -22,7 +22,7 @@ def prepare_math_dataset_final_reliable():
     # 定义任务配置：(远程分集名, 本地文件名)
     tasks = [
         ("test", "validation.jsonl"),
-        ("train", "sft.jsonl")
+        ("train", "train_raw.jsonl")
     ]
     
     subjects = ["algebra", "counting_and_probability", "geometry", 
@@ -73,5 +73,5 @@ def download_model():
 
 
 if __name__ == "__main__":
-    prepare_math_dataset_final_reliable()
+    #prepare_math_dataset_final_reliable()
     download_model()
