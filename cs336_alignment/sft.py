@@ -67,7 +67,7 @@ PROMPT_TEMPLATE = (
 # vLLM Helper Functions
 # -----------------------------------------------------------------------------
 def init_vllm(
-    model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.4
+    model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.8
 ) -> LLM:
     """
     Initialize vLLM inference engine on a specific device.
@@ -556,7 +556,7 @@ def main():
     parser.add_argument(
         "--num_eval_samples",
         type=int,
-        default=1000,
+        default=5000,
         help="Number of validation samples to evaluate on",
     )
 
@@ -618,7 +618,7 @@ def main():
             if args.filter_sft_data:
                 run_name = f"sft_filtered"
             else:
-                run_name = f"sft_samples_{args.num_samples if args.num_samples else 'full'}"
+                run_name = f"sft_{args.num_samples if args.num_samples else 'full'}"
 
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
