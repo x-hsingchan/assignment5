@@ -49,6 +49,7 @@ MODEL_DIR = BASE_DIR / "model"
 MODEL_NAME = "Qwen2.5-Math-1.5B"
 MODEL_PATH = MODEL_DIR / MODEL_NAME
 SFT_DATA_PATH = DATA_DIR / "MATH" / "sft.jsonl"
+FILTERED_SFT_DATA_PATH = DATA_DIR / "MATH" / "sft_filtered.jsonl"
 VAL_DATA_PATH = DATA_DIR / "MATH" / "validation.jsonl"
 SAVE_DIR = BASE_DIR / "checkpoints"
 
@@ -66,7 +67,7 @@ PROMPT_TEMPLATE = (
 # vLLM Helper Functions
 # -----------------------------------------------------------------------------
 def init_vllm(
-    model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85
+    model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.4
 ) -> LLM:
     """
     Initialize vLLM inference engine on a specific device.
@@ -195,7 +196,7 @@ def evaluate_on_validation(
     val_dataset: ValidationDataset,
     num_eval_samples: int = 100,
     temperature: float = 0.7,
-    max_tokens: int = 512,
+    max_tokens: int = 1024,
 ) -> Dict[str, float]:
     """
     Evaluate the model on the validation set using vLLM.
@@ -236,13 +237,16 @@ def evaluate_on_validation(
     correct_count = 0
     format_correct_count = 0
     total_reward = 0.0
+
+    correct_lens = []
+    incorrect_lens = []
     response_lengths = []
 
     eval_logs = []
 
     for i, output in enumerate(outputs):
         response_text = output.outputs[0].text
-        # Add back the stop token for complete formatting
+        # Add back the stop token for complete formatting(no problem)
         if "</answer>" not in response_text:
             response_text += " </answer>"
 
@@ -251,13 +255,19 @@ def evaluate_on_validation(
         # Compute rewards
         reward_metrics = r1_zero_reward_fn(response_text, ground_truth)
 
+        # token nums (include </answer>...)
+        approx_len = len(tokenizer.encode(response_text))
+
         if reward_metrics["answer_reward"] == 1.0:
             correct_count += 1
+            correct_lens.append(approx_len)
+        else:
+            incorrect_lens.append(approx_len)
         if reward_metrics["format_reward"] == 1.0:
             format_correct_count += 1
 
         total_reward += reward_metrics["reward"]
-        response_lengths.append(len(tokenizer.encode(response_text)))
+        response_lengths.append(approx_len)
 
         eval_logs.append(
             {
@@ -281,6 +291,8 @@ def evaluate_on_validation(
         "eval/format_accuracy": format_accuracy,
         "eval/avg_reward": avg_reward,
         "eval/avg_response_length": avg_response_length,
+        "eval/avg_len_correct": np.mean(correct_lens) if correct_lens else 0,
+        "eval/avg_len_incorrect": np.mean(incorrect_lens) if incorrect_lens else 0,
     }
 
     return metrics, eval_logs
@@ -331,7 +343,13 @@ def train_sft(
 
     # Training state
     global_step = 0
-    eval_step = 0
+
+
+    if args.gradient_checkpointing:
+        print("Gradient checkpointing enabled.")
+        model.gradient_checkpointing_enable()
+    else:
+        print("Gradient checkpointing disabled.")
     model.train()
 
     print(f"\n{'=' * 80}")
@@ -346,6 +364,51 @@ def train_sft(
     print(f"Learning rate: {args.learning_rate}")
     print(f"Warmup steps: {warmup_steps}")
     print(f"{'=' * 80}\n")
+
+
+# =========================================================================
+    # NEW: Initial Evaluation (Step 0)
+    # =========================================================================
+    print(f"\nrunning initial evaluation (Step 0)...")
+    model.eval()
+    load_policy_into_vllm_instance(model, llm)
+
+    eval_metrics, eval_logs = evaluate_on_validation(
+        llm,
+        tokenizer,
+        val_dataset,
+        num_eval_samples=args.num_eval_samples,
+        temperature=args.eval_temperature,
+        max_tokens=args.max_eval_tokens,
+    )
+
+    print(f"Initial Eval Results:")
+    print(f"  Accuracy: {eval_metrics['eval/accuracy']:.4f}")
+    print(f"  Format Accuracy: {eval_metrics['eval/format_accuracy']:.4f}")
+    print(f"  Avg Reward: {eval_metrics['eval/avg_reward']:.4f}")
+
+    if wandb.run is not None:
+        table = wandb.Table(
+            columns=["Prompt", "Response", "Ground Truth", "Format Reward", "Answer Reward", "Total Reward"]
+        )
+        for log in eval_logs[:10]:
+            table.add_data(
+                log["prompt"][:200] + "...",
+                log["response"],
+                str(log["ground_truth"]),
+                log["format_reward"],
+                log["answer_reward"],
+                log["total_reward"],
+            )
+        eval_metrics["eval/samples_table"] = table
+        eval_metrics["train_step"] = global_step
+        wandb.log(eval_metrics)
+
+
+    model.train()
+    print(f"{'=' * 80}\n")
+    # =========================================================================
+
 
     # Training loop
     for epoch in range(args.num_epochs):
@@ -363,10 +426,10 @@ def train_sft(
             response_mask = batch["response_mask"].to(args.device)
 
             # Compute log probabilities
-            with torch.no_grad():
-                log_probs_output = get_response_log_probs(
-                    model, input_ids, labels, return_token_entropy=False
-                )
+            # with torch.no_grad():
+            log_probs_output = get_response_log_probs(
+                model, input_ids, labels, return_token_entropy=False
+            )
             policy_log_probs = log_probs_output["log_probs"]
 
             # Compute number of response tokens for normalization
@@ -463,11 +526,10 @@ def train_sft(
                             )
 
                         eval_metrics["eval/samples_table"] = table
-                        eval_metrics["eval_step"] = eval_step
+                        eval_metrics["train_step"] = global_step
 
                         wandb.log(eval_metrics)
 
-                    eval_step += 1
                     model.train()
 
                     print(f"{'=' * 80}\n")
@@ -485,38 +547,28 @@ def train_sft(
 def main():
     parser = argparse.ArgumentParser(description="SFT Training for Qwen 2.5 Math 1.5B")
 
-    # Data arguments
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Number of training samples to use (None = use all)",
+    parser.add_argument("--filter_sft_data",action="store_true",default=False) # use all data by default
+    parser.add_argument("--train_data",type=str,default=None,
+        help="Path to training data file (default: data/MATH/sft.jsonl)",
     )
+    # Data arguments
+    parser.add_argument("--num_samples",type=int,default=None)#Number of training samples to use (None = use all)
     parser.add_argument(
         "--num_eval_samples",
         type=int,
-        default=100,
+        default=1000,
         help="Number of validation samples to evaluate on",
     )
 
     # Model arguments
-    parser.add_argument(
-        "--model_path", type=str, default=str(MODEL_PATH), help="Path to base model"
-    )
+    parser.add_argument("--model_path", type=str, default=str(MODEL_PATH))
 
     # Training hyperparameters
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=4,
-        help="Gradient accumulation steps",
-    )
-    parser.add_argument(
-        "--learning_rate", type=float, default=5e-6, help="Learning rate"
-    )
-    parser.add_argument("--num_epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument(
         "--max_grad_norm",
         type=float,
@@ -525,43 +577,27 @@ def main():
     )
 
     # Evaluation arguments
-    parser.add_argument(
-        "--eval_every", type=int, default=50, help="Evaluate every N steps"
-    )
-    parser.add_argument(
-        "--eval_temperature", type=float, default=0.7, help="Temperature for evaluation"
-    )
-    parser.add_argument(
-        "--max_eval_tokens", type=int, default=1024, help="Max tokens for evaluation"
-    )
-
+    parser.add_argument("--eval_every", type=int, default=10, help="Evaluate every N steps")
+    parser.add_argument("--eval_temperature", type=float, default=0.7)
+    parser.add_argument("--max_eval_tokens", type=int, default=1024)
     # Device arguments
+    parser.add_argument("--policy_device", type=str, default="cuda:0")
+    parser.add_argument("--vllm_device", type=str, default="cuda:1")
     parser.add_argument(
-        "--policy_device", type=str, default="cuda:0", help="Device for policy model"
+        "--gradient_checkpointing",
+        action="store_true",
+        default=True,  # 显存较小时建议默认设为 True
+        help="Enable gradient checkpointing to save VRAM (default: True)"
     )
-    parser.add_argument(
-        "--vllm_device", type=str, default="cuda:1", help="Device for vLLM"
-    )
-
     # WandB arguments
-    parser.add_argument(
-        "--wandb_project", type=str, default="sft-qwen-math", help="WandB project name"
-    )
-    parser.add_argument(
-        "--wandb_run_name", type=str, default=None, help="WandB run name"
-    )
+    parser.add_argument("--wandb_project", type=str, default="sft-qwen-math")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
-
     # Reproducibility
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-
     # Checkpoint saving
-    parser.add_argument(
-        "--save_model", action="store_true", help="Save model after training"
-    )
-    parser.add_argument(
-        "--save_path", type=str, default=None, help="Path to save model"
-    )
+    parser.add_argument("--save_model", action="store_true", default=True, help="Save model after training")
+    parser.add_argument("--save_path", type=str, default=None, help="Path to save model")
 
     args = parser.parse_args()
 
@@ -579,15 +615,17 @@ def main():
     if not args.no_wandb:
         run_name = args.wandb_run_name
         if run_name is None:
-            run_name = f"sft_samples{args.num_samples if args.num_samples else 'full'}_lr{args.learning_rate}_bs{args.batch_size * args.gradient_accumulation_steps}"
+            if args.filter_sft_data:
+                run_name = f"sft_filtered"
+            else:
+                run_name = f"sft_samples_{args.num_samples if args.num_samples else 'full'}"
 
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
         # Setup WandB metrics
         wandb.define_metric("train_step")
-        wandb.define_metric("eval_step")
         wandb.define_metric("train/*", step_metric="train_step")
-        wandb.define_metric("eval/*", step_metric="eval_step")
+        wandb.define_metric("eval/*", step_metric="train_step")
 
     print(f"\n{'=' * 80}")
     print(f"SFT Training Configuration")
@@ -615,7 +653,15 @@ def main():
 
     # Load datasets
     print(f"\nLoading datasets...")
-    train_dataset = SFTDataset(SFT_DATA_PATH, num_samples=args.num_samples)
+
+    if args.train_data is None:
+        if args.filter_sft_data:
+            train_data_path = FILTERED_SFT_DATA_PATH
+        else:
+            train_data_path = SFT_DATA_PATH
+    else:
+        train_data_path = Path(args.train_data)
+    train_dataset = SFTDataset(train_data_path, num_samples=args.num_samples)
     val_dataset = ValidationDataset(VAL_DATA_PATH)
 
     # Train
@@ -658,10 +704,7 @@ def main():
     if args.save_model:
         save_path = args.save_path
         if save_path is None:
-            save_path = (
-                SAVE_DIR
-                / f"sft_samples{args.num_samples if args.num_samples else 'full'}"
-            )
+            save_path = (SAVE_DIR / run_name)
         save_path = Path(save_path)
         save_path.mkdir(parents=True, exist_ok=True)
 
